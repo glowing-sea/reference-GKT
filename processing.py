@@ -2,9 +2,9 @@ import numpy as np
 import pandas as pd
 import os
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F # contain stateless functions such as relu, softmax, embedding, dropout, one_hot, pad, etc. Not trainable.
 from torch.utils.data import Dataset, TensorDataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
+from torch.nn.utils.rnn import pad_sequence # [batch_size, max_seq_len, 2 * concept_num]
 from utils import build_dense_graph
 
 # Graph-based Knowledge Tracing: Modeling Student Proficiency Using Graph Neural Network.
@@ -15,7 +15,7 @@ from utils import build_dense_graph
 
 class KTDataset(Dataset):
     def __init__(self, features, questions, answers):
-        super(KTDataset, self).__init__()
+        super(KTDataset, self).__init__() # Call Dataset.__init__(self), but Dataset has no __init__ function.
         self.features = features
         self.questions = questions
         self.answers = answers

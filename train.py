@@ -1,11 +1,11 @@
 import numpy as np
 import time
 import random
-import argparse
-import pickle
-import os
-import gc
-import datetime
+import argparse # for parsing command line arguments
+import pickle # for saving and loading model parameters
+import os # for file path operations
+import gc # for garbage collection
+import datetime # for timestamping saved models
 import torch
 import torch.optim as optim
 from torch.optim import lr_scheduler
@@ -21,8 +21,12 @@ from processing import load_dataset
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--no-cuda', action='store_false', default=True, help='Disables CUDA training.')
+
+# device arguments
+parser.add_argument('--cuda', action='store_true', default=False, help='Disables CUDA training.')
 parser.add_argument('--seed', type=int, default=42, help='Random seed.')
+
+# files and directories
 parser.add_argument('--data-dir', type=str, default='data', help='Data dir for loading input data.')
 parser.add_argument('--data-file', type=str, default='assistment_test15.csv', help='Name of input data file.')
 parser.add_argument('--save-dir', type=str, default='logs', help='Where to save the trained model, leave empty to not save anything.')
@@ -30,23 +34,16 @@ parser.add_argument('-graph-save-dir', type=str, default='graphs', help='Dir for
 parser.add_argument('--load-dir', type=str, default='', help='Where to load the trained model if finetunning. ' + 'Leave empty to train from scratch')
 parser.add_argument('--dkt-graph-dir', type=str, default='dkt-graph', help='Where to load the pretrained dkt graph.')
 parser.add_argument('--dkt-graph', type=str, default='dkt_graph.txt', help='DKT graph data file name.')
+parser.add_argument('--test', type=bool, default=False, help='Whether to test for existed model.')
+parser.add_argument('--test-model-dir', type=str, default='logs/expDKT', help='Existed model file dir.')
+
+# model parameters
 parser.add_argument('--model', type=str, default='GKT', help='Model type to use, support GKT and DKT.')
 parser.add_argument('--hid-dim', type=int, default=32, help='Dimension of hidden knowledge states.')
 parser.add_argument('--emb-dim', type=int, default=32, help='Dimension of concept embedding.')
-parser.add_argument('--attn-dim', type=int, default=32, help='Dimension of multi-head attention layers.')
-parser.add_argument('--vae-encoder-dim', type=int, default=32, help='Dimension of hidden layers in vae encoder.')
-parser.add_argument('--vae-decoder-dim', type=int, default=32, help='Dimension of hidden layers in vae decoder.')
-parser.add_argument('--edge-types', type=int, default=2, help='The number of edge types to infer.')
-parser.add_argument('--graph-type', type=str, default='Dense', help='The type of latent concept graph.')
 parser.add_argument('--dropout', type=float, default=0, help='Dropout rate (1 - keep probability).')
 parser.add_argument('--bias', type=bool, default=True, help='Whether to add bias for neural network layers.')
-parser.add_argument('--binary', type=bool, default=True, help='Whether only use 0/1 for results.')
-parser.add_argument('--result-type', type=int, default=12, help='Number of results types when multiple results are used.')
 parser.add_argument('--temp', type=float, default=0.5, help='Temperature for Gumbel softmax.')
-parser.add_argument('--hard', action='store_true', default=False, help='Uses discrete samples in training forward pass.')
-parser.add_argument('--no-factor', action='store_true', default=False, help='Disables factor graph model.')
-parser.add_argument('--prior', action='store_true', default=False, help='Whether to use sparsity prior.')
-parser.add_argument('--var', type=float, default=1, help='Output variance.')
 parser.add_argument('--epochs', type=int, default=50, help='Number of epochs to train.')
 parser.add_argument('--batch-size', type=int, default=128, help='Number of samples per batch.')
 parser.add_argument('--train-ratio', type=float, default=0.6, help='The ratio of training samples in a dataset.')
@@ -55,25 +52,40 @@ parser.add_argument('--shuffle', type=bool, default=True, help='Whether to shuff
 parser.add_argument('--lr', type=float, default=0.001, help='Initial learning rate.')
 parser.add_argument('--lr-decay', type=int, default=200, help='After how epochs to decay LR by a factor of gamma.')
 parser.add_argument('--gamma', type=float, default=0.5, help='LR decay factor.')
-parser.add_argument('--test', type=bool, default=False, help='Whether to test for existed model.')
-parser.add_argument('--test-model-dir', type=str, default='logs/expDKT', help='Existed model file dir.')
 
+# ??????????
+parser.add_argument('--binary', type=bool, default=True, help='Whether only use 0/1 for results.')
+parser.add_argument('--attn-dim', type=int, default=32, help='Dimension of multi-head attention layers.')
+parser.add_argument('--vae-encoder-dim', type=int, default=32, help='Dimension of hidden layers in vae encoder.')
+parser.add_argument('--vae-decoder-dim', type=int, default=32, help='Dimension of hidden layers in vae decoder.')
+parser.add_argument('--edge-types', type=int, default=2, help='The number of edge types to infer.')
+parser.add_argument('--graph-type', type=str, default='Dense', help='The type of latent concept graph.')
+parser.add_argument('--result-type', type=int, default=12, help='Number of results types when multiple results are used.')
+parser.add_argument('--hard', action='store_true', default=False, help='Uses discrete samples in training forward pass.')
+parser.add_argument('--no-factor', action='store_true', default=False, help='Disables factor graph model.')
+parser.add_argument('--prior', action='store_true', default=False, help='Whether to use sparsity prior.')
+parser.add_argument('--var', type=float, default=1, help='Output variance.')
 
 
 args = parser.parse_args()
-args.cuda = not args.no_cuda and torch.cuda.is_available()
+args.cuda = args.cuda and torch.cuda.is_available()
 args.factor = not args.no_factor
 print(args)
 
-random.seed(args.seed)
-np.random.seed(args.seed)
-torch.manual_seed(args.seed)
+random.seed(args.seed) # Python built-in RNG.
+np.random.seed(args.seed) # Numpy RNG.
+torch.manual_seed(args.seed) # CPU RNG inside Pytorch
 if args.cuda:
-    torch.cuda.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+    torch.cuda.manual_seed(args.seed) # GPU RNG inside Pytorch
+    torch.cuda.manual_seed_all(args.seed) # All GPU RNGs inside Pytorch
+    # Run multiple convolution algorithms.
+    # Benchmark them.
+    # Choose the fastest algoritm for your hardware + input size.
+    # Deterministic but slower and faster but nondeterministic.
+    torch.backends.cudnn.benchmark = False # Presents cuDNN from picking random algorithms.
+    torch.backends.cudnn.deterministic = True # Prevents nondeterministic cuDNN operations.
 
+# Binary of multi-class results
 res_len = 2 if args.binary else args.result_type
 
 # Save model and meta-data. Always saves in a new sub-folder.
@@ -103,8 +115,9 @@ if args.save_dir:
 else:
     print("WARNING: No save_dir provided!" + "Testing (within this script) will throw an error.")
 
+
 # load dataset
-dataset_path = os.path.join(args.data_dir, args.data_file)
+dataset_path = os.path.join(args.data_dir, args.data_file) # os-independent.
 dkt_graph_path = os.path.join(args.dkt_graph_dir, args.dkt_graph)
 if not os.path.exists(dkt_graph_path):
     dkt_graph_path = None

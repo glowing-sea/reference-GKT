@@ -8,9 +8,9 @@ from torch.autograd import Variable
 # Author: jhljx
 # Email: jhljx8918@gmail.com
 
-
+# It is row stochastic matrix and double stochastic matrix of a complete graph without self-loops.
 def build_dense_graph(node_num):
-    graph = 1. / (node_num - 1) * np.ones((node_num, node_num))
+    graph = 1. / (node_num - 1) * np.ones((node_num, node_num)) # node_num - 1 to make each row sum to 1
     np.fill_diagonal(graph, 0)
     graph = torch.from_numpy(graph).float()
     return graph
