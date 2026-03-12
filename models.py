@@ -323,17 +323,30 @@ class MultiHeadAttention(nn.Module):
     NOTE: Stole and modify from https://github.com/jadore801120/attention-is-all-you-need-pytorch/blob/master/transformer/SubLayers.py
     """
 
-    def __init__(self, n_head, concept_num, input_dim, d_k, dropout=0.):
+    def __init__(self, n_head, # number of heads
+                 concept_num, # number of concepts
+                 input_dim, # input dimension (embedding dimension)
+                 d_k, # attention dimension
+                 dropout=0.): # dropout rate
         super(MultiHeadAttention, self).__init__()
         self.n_head = n_head
         self.concept_num = concept_num
         self.d_k = d_k
-        self.w_qs = nn.Linear(input_dim, n_head * d_k, bias=False)
-        self.w_ks = nn.Linear(input_dim, n_head * d_k, bias=False)
-        self.attention = ScaledDotProductAttention(temperature=d_k ** 0.5, attn_dropout=dropout)
+        self.w_qs = nn.Linear(input_dim, n_head * d_k, bias=False) # W_Q in R^(input_dim, n_head * d_k)
+        self.w_ks = nn.Linear(input_dim, n_head * d_k, bias=False) # W_K in R^(input_dim, n_head * d_k)
+        self.attention = ScaledDotProductAttention(temperature=d_k ** 0.5, attn_dropout=dropout) # scaled dot-product attention for softmax(QK^T / sqrt(d_k))
         # inferred latent graph, used for saving and visualization
-        self.graphs = nn.Parameter(torch.zeros(n_head, concept_num, concept_num))
-        self.graphs.requires_grad = False
+        self.graphs = nn.Parameter(torch.zeros(n_head, concept_num, concept_num)) # in R^(n_head, concept_num, concept_num) = a graph for each head
+        # nn.Parameter is a Tensor that is automatically added to the list of model parameters, meaning:
+            # It will appear in model.parameters()
+            # It will be saved and loaded with the model
+            # It can receive gradients (unless requires_grad=False)
+        # Why using nn.Parameter here?
+            # We want to save the inferred graphs when saving the model
+            # They should use
+            # self.register_buffer("graphs", torch.zeros(n_head, concept_num, concept_num))
+        
+        self.graphs.requires_grad = False # no gradient because they're just logs for later use
 
     def _get_graph(self, attn_score, qt):
         r"""
@@ -342,16 +355,36 @@ class MultiHeadAttention(nn.Module):
             qt: masked question index
         Shape:
             attn_score: [n_head, mask_num, concept_num]
-            qt: [mask_num]
+                mask_num = number of non-padded students in this batch at this timestamp.
+                Suppose batch size = 4
+                At time t, qt = [5, 2, -1, 7]
+                mask_num = 3
+                If we have 2 heads
+                then we have [2, 3, concept_num] attention score matrix
+            qt: [mask_num]: masked question index
         Return:
             graphs: n_head types of inferred graphs
         """
+        # Initialise an empty adjacency matrix for each head with zeros
         graphs = Variable(torch.zeros(self.n_head, self.concept_num, self.concept_num, device=qt.device))
-        for k in range(self.n_head):
-            index_tuple = (qt.long(), )
-            graphs[k] = graphs[k].index_put(index_tuple, attn_score[k])  # used for calculation
+        # In modern PyTorch, Variable is no longer needed.
+            # Tensors now have the same capabilities as Variables used to have.
+        for k in range(self.n_head): # for each head
+            index_tuple = (qt.long(), ) # 
+            # For each head k
+                # For each query concept 
+                    # c=qt[i]
+                    # Fill row c with the attention weights toward all concepts
+            # This creates adjacency: edge weights(c -> j) = attention(Qc, Kj)
+            graphs[k] = graphs[k].index_put(index_tuple, attn_score[k])  # graphs[k]:[qt[i],:] = attn_score[k][i,:] for i in range(mask_num)
             #############################
             # here, we need to detach edges when storing it into self.graphs in case memory leak!
+            # atten_score[k] is part of the computation graph.
+            # If you write it into self.graphs without detaching:
+            #     It becomes a leaf tensor requiring gradient
+            #     Backward will try to propagate into this stored tensor
+            #     This leads to memory leaks because the graph never gets freed
+            #     Model saving would store large autograd metadata
             self.graphs.data[k] = self.graphs.data[k].index_put(index_tuple, attn_score[k].detach())  # used for saving and visualization
             #############################
         return graphs
@@ -360,9 +393,9 @@ class MultiHeadAttention(nn.Module):
         r"""
         Parameters:
             qt: masked question index
-            query: answered concept embedding for a student batch
-            key: concept embedding matrix
-            mask: mask matrix
+            query: answered concept embedding for a student batch, Q
+            key: concept embedding matrix, K
+            mask: mask matrix, no self-attention for each concept
         Shape:
             qt: [mask_num]
             query: [mask_num, embedding_dim]
@@ -370,31 +403,46 @@ class MultiHeadAttention(nn.Module):
         Return:
             graphs: n_head types of inferred graphs
         """
-        d_k, n_head = self.d_k, self.n_head
-        len_q, len_k = query.size(0), key.size(0)
+        d_k, n_head = self.d_k, self.n_head # dimension of attention, number of heads
+        len_q, len_k = query.size(0), key.size(0) # number of masked concepts, number of concepts
 
         # Pass through the pre-attention projection: lq x (n_head *dk)
         # Separate different heads: lq x n_head x dk
-        q = self.w_qs(query).view(len_q, n_head, d_k)
-        k = self.w_ks(key).view(len_k, n_head, d_k)
+        q = self.w_qs(query).view(len_q, n_head, d_k) # dim = len_q x n_head x d_k
+        k = self.w_ks(key).view(len_k, n_head, d_k) # dim = len_k x n_head x d_k
 
         # Transpose for attention dot product: n_head x lq x dk
-        q, k = q.transpose(0, 1), k.transpose(0, 1)
-        attn_score = self.attention(q, k, mask=mask)  # [n_head, mask_num, concept_num]
+        q, k = q.transpose(0, 1), k.transpose(0, 1) # dim_q = n_head x len_q x d_k, dim_k = n_head x len_k x d_k
+        attn_score = self.attention(q, k, mask=mask)  # dim = n_head x len_q x len_k = n_head x mask_num x concept_num
         graphs = self._get_graph(attn_score, qt)
         return graphs
 
 
 class VAE(nn.Module):
 
-    def __init__(self, input_dim, hidden_dim, output_dim, msg_hidden_dim, msg_output_dim, concept_num, edge_type_num=2,
-                 tau=0.1, factor=True, dropout=0., bias=True):
+    def __init__(self, input_dim, # embedding dimension of each concept
+                 hidden_dim, # encoder hidden dimension !!
+                 output_dim, # number of edge types
+                 msg_hidden_dim, # decoder intermediate size !!
+                 msg_output_dim, # decoder intermediate size !!
+                 concept_num, # number of concepts
+                 edge_type_num=2, # number of edge types
+                 tau=0.1, # Gumbel-Softmax temperature
+                 factor=True, # use factor graph or not (from NRI paper)
+                 dropout=0., 
+                 bias=True):
         super(VAE, self).__init__()
+        # model parameters
         self.edge_type_num = edge_type_num
         self.concept_num = concept_num
         self.tau = tau
+        
+        # in: [concept_num, embedding_dim]
+        # out [edge_num, output_dim] = [edge_num, edge_type_num]
         self.encoder = MLPEncoder(input_dim, hidden_dim, output_dim, factor=factor, dropout=dropout, bias=bias)
         self.decoder = MLPDecoder(input_dim, msg_hidden_dim, msg_output_dim, hidden_dim, edge_type_num, dropout=dropout, bias=bias)
+
+
         # inferred latent graph, used for saving and visualization
         self.graphs = nn.Parameter(torch.zeros(edge_type_num, concept_num, concept_num))
         self.graphs.requires_grad = False
@@ -443,7 +491,13 @@ class VAE(nn.Module):
             output: the reconstructed data
             prob: q(z|x) distribution
         """
+        # inputs	[C, D]	Concept embeddings (for all concepts)
+        # sp_send	[E, C]	One-hot: which concept is the sender of each edge
+        # sp_rec	[E, C]	One-hot: which concept is the receiver of each edge
+        # sp_send_t	[C, E]	Transposed sender one-hot
+        # sp_rec_t	[C, E]	Transposed receiver one-hot
         logits = self.encoder(data, sp_send, sp_rec, sp_send_t, sp_rec_t)  # [edge_num, output_dim(edge_type_num)]
+
         edges = gumbel_softmax(logits, tau=self.tau, dim=-1)  # [edge_num, edge_type_num]
         prob = F.softmax(logits, dim=-1)
         output = self.decoder(data, edges, sp_send, sp_rec, sp_send_t, sp_rec_t)  # [concept_num, embedding_dim]

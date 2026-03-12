@@ -19,6 +19,7 @@ from processing import load_dataset
 # Author: jhljx
 # Email: jhljx8918@gmail.com
 
+# python3 train.py --data-file=skill_builder_data.csv --model=GKT --graph-type=Dense --batch-size=32 --epoch=2
 
 parser = argparse.ArgumentParser()
 
@@ -26,16 +27,24 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--cuda', action='store_true', default=False, help='Disables CUDA training.')
 parser.add_argument('--seed', type=int, default=42, help='Random seed.')
 
-# files and directories
-parser.add_argument('--data-dir', type=str, default='data', help='Data dir for loading input data.')
-parser.add_argument('--data-file', type=str, default='assistment_test15.csv', help='Name of input data file.')
+
+# Saving locations
 parser.add_argument('--save-dir', type=str, default='logs', help='Where to save the trained model, leave empty to not save anything.')
 parser.add_argument('-graph-save-dir', type=str, default='graphs', help='Dir for saving concept graphs.')
+
+
+# Loading data
+parser.add_argument('--data-dir', type=str, default='data', help='Data dir for loading input data.')
+parser.add_argument('--data-file', type=str, default='assistment_test15.csv', help='Name of input data file.')
+# Loading pretrained models
 parser.add_argument('--load-dir', type=str, default='', help='Where to load the trained model if finetunning. ' + 'Leave empty to train from scratch')
+# Loading pretrained dkt graph
 parser.add_argument('--dkt-graph-dir', type=str, default='dkt-graph', help='Where to load the pretrained dkt graph.')
 parser.add_argument('--dkt-graph', type=str, default='dkt_graph.txt', help='DKT graph data file name.')
+# Loading trained models for testing
 parser.add_argument('--test', type=bool, default=False, help='Whether to test for existed model.')
 parser.add_argument('--test-model-dir', type=str, default='logs/expDKT', help='Existed model file dir.')
+
 
 # model parameters
 parser.add_argument('--model', type=str, default='GKT', help='Model type to use, support GKT and DKT.')
@@ -52,17 +61,17 @@ parser.add_argument('--shuffle', type=bool, default=True, help='Whether to shuff
 parser.add_argument('--lr', type=float, default=0.001, help='Initial learning rate.')
 parser.add_argument('--lr-decay', type=int, default=200, help='After how epochs to decay LR by a factor of gamma.')
 parser.add_argument('--gamma', type=float, default=0.5, help='LR decay factor.')
-
-# ??????????
 parser.add_argument('--binary', type=bool, default=True, help='Whether only use 0/1 for results.')
-parser.add_argument('--attn-dim', type=int, default=32, help='Dimension of multi-head attention layers.')
-parser.add_argument('--vae-encoder-dim', type=int, default=32, help='Dimension of hidden layers in vae encoder.')
-parser.add_argument('--vae-decoder-dim', type=int, default=32, help='Dimension of hidden layers in vae decoder.')
 parser.add_argument('--edge-types', type=int, default=2, help='The number of edge types to infer.')
 parser.add_argument('--graph-type', type=str, default='Dense', help='The type of latent concept graph.')
+parser.add_argument('--attn-dim', type=int, default=32, help='Dimension of multi-head attention layers.')
 parser.add_argument('--result-type', type=int, default=12, help='Number of results types when multiple results are used.')
+parser.add_argument('--no-factor', action='store_true', default=False, help='Disables factor graph model.') # Use factor graph encoder or not.
+parser.add_argument('--vae-encoder-dim', type=int, default=32, help='Dimension of hidden layers in vae encoder.')
+parser.add_argument('--vae-decoder-dim', type=int, default=32, help='Dimension of hidden layers in vae decoder.')
+
+
 parser.add_argument('--hard', action='store_true', default=False, help='Uses discrete samples in training forward pass.')
-parser.add_argument('--no-factor', action='store_true', default=False, help='Disables factor graph model.')
 parser.add_argument('--prior', action='store_true', default=False, help='Whether to use sparsity prior.')
 parser.add_argument('--var', type=float, default=1, help='Output variance.')
 
@@ -105,6 +114,8 @@ if args.save_dir:
     save_dir = '{}/exp{}/'.format(args.save_dir, model_file_name + timestamp)
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
+
+    # 5 files will be saved:
     meta_file = os.path.join(save_dir, 'metadata.pkl')
     model_file = os.path.join(save_dir, model_file_name + '.pt')
     optimizer_file = os.path.join(save_dir, model_file_name + '-Optimizer.pt')
@@ -125,26 +136,84 @@ concept_num, graph, train_loader, valid_loader, test_loader = load_dataset(datas
                                                                            train_ratio=args.train_ratio, val_ratio=args.val_ratio, shuffle=args.shuffle,
                                                                            model_type=args.model, use_cuda=args.cuda)
 
+# The DataLoader returns three padded sequences:
+# features  shape: [batch_size, seq_len]
+# questions shape: [batch_size, seq_len]
+# answers   shape: [batch_size, seq_len]
+# Where:
+# features[b, t] = integer feature index = skill * 2 + correct
+# questions[b, t] = integer skill ID
+# answers[b, t] = 0 or 1
+
 # build models
 graph_model = None
 if args.model == 'GKT':
     if args.graph_type == 'MHA':
-        graph_model = MultiHeadAttention(args.edge_types, concept_num, args.emb_dim, args.attn_dim, dropout=args.dropout)
+        # in n_head x mask_num x concept_num
+        graph_model = MultiHeadAttention(args.edge_types, # number of heads
+                                         concept_num, # number of concepts
+                                         args.emb_dim, # embedding dimension (dimension of key, query)
+                                         args.attn_dim, # attention dimension
+                                         dropout=args.dropout) # dropout rate
     elif args.graph_type == 'VAE':
-        graph_model = VAE(args.emb_dim, args.vae_encoder_dim, args.edge_types, args.vae_decoder_dim, args.vae_decoder_dim, concept_num,
-                          edge_type_num=args.edge_types, tau=args.temp, factor=args.factor, dropout=args.dropout, bias=args.bias)
-        vae_loss = VAELoss(concept_num, edge_type_num=args.edge_types, prior=args.prior, var=args.var)
+        # In GKT, the “observed data” is the concept embeddings.
+        # The “latent factors” are the edges between concepts.
+        # “What hidden graph structure can best explain why these concept embeddings look the way they do?”
+        #
+        # Encoder
+        # q(z_ij) = P(z_ij = k | x)
+        # For concept pair i -> j, how likely is it that the edge is of type k?
+        #
+        # Decoder
+        # Given the edges z_ij, it computes messages:
+        # i → j:   f_k(embedding_i, embedding_j)
+        # embedding_j_new = sum of all incoming messages
+        graph_model = VAE(args.emb_dim, # embedding dimension for each concept or feature(concept+answer)
+                          args.vae_encoder_dim, 
+                          args.edge_types, # number of edge types
+                          args.vae_decoder_dim, 
+                          args.vae_decoder_dim, 
+                          concept_num,
+                          edge_type_num=args.edge_types, # number of edge types
+                          tau=args.temp, 
+                          factor=args.factor, 
+                          dropout=args.dropout, 
+                          bias=args.bias)
+        
+        vae_loss = VAELoss(concept_num, 
+                           edge_type_num=args.edge_types, 
+                           prior=args.prior, 
+                           var=args.var)
         if args.cuda:
             vae_loss = vae_loss.cuda()
     if args.cuda and args.graph_type in ['MHA', 'VAE']:
         graph_model = graph_model.cuda()
-    model = GKT(concept_num, args.hid_dim, args.emb_dim, args.edge_types, args.graph_type, graph=graph, graph_model=graph_model,
-                dropout=args.dropout, bias=args.bias, has_cuda=args.cuda)
+
+    model = GKT(concept_num, # number of concepts
+                args.hid_dim, # hidden dimension
+                args.emb_dim, # embedding dimension
+                args.edge_types, # number of edge types (2 for dense/Transition graph)
+                args.graph_type, # Dense, Transition, MHA, VAE
+                graph=graph, # static graph, optional
+                graph_model=graph_model, # MHA or VAE model for graph learning, optional
+                dropout=args.dropout, 
+                bias=args.bias, 
+                has_cuda=args.cuda)
+    
 elif args.model == 'DKT':
-    model = DKT(res_len * concept_num, args.emb_dim, concept_num, dropout=args.dropout, bias=args.bias)
+    model = DKT(res_len * concept_num, # 
+                args.emb_dim, # embedding dimension
+                concept_num, # number of concepts
+                dropout=args.dropout, 
+                bias=args.bias)
 else:
     raise NotImplementedError(args.model + ' model is not implemented!')
 kt_loss = KTLoss()
+
+
+
+# ========================================
+
 
 # build optimizer
 optimizer = optim.Adam(model.parameters(), lr=args.lr)

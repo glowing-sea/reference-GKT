@@ -1,0 +1,32 @@
+Why my CPU can outperform my GPU for this model?
+
+The model is extreme small
+
+1. Your GKT configuration is tiny:
+* hidden_dim = 32
+* embedding_dim = 32
+* concept_num = few hundred
+* MLPs with 2-3 layers of 32-64 units
+* GRU of 32 units per concept
+
+GPU gains only appear when:
+* large batches
+* large matrices
+* heavy convolutions
+* wide layers
+
+2. GPU cost per kernel launch is high
+
+3. GKT heavily uses Python loops and non-vectorised operations:
+
+* _aggregate()
+* _agg_neighbors()
+* update()
+* predict()
+
+Inside these are:
+* many indexing operations, like torch.where and index_put
+
+4. The DataLoader & padding overhead is CPU-bound
+
+Padding or masking performs on CPU before moving to GPU

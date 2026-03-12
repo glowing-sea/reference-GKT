@@ -1,4 +1,6 @@
+from hashlib import new
 import math
+from matplotlib.patheffects import Normal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -93,13 +95,20 @@ class EraseAddGate(nn.Module):
         return res
 
 
+
+
+
+# READ
 class ScaledDotProductAttention(nn.Module):
     """
     Scaled Dot-Product Attention
     NOTE: Stole and modify from https://github.com/jadore801120/attention-is-all-you-need-pytorch/blob/master/transformer/Modules.py
     """
 
-    def __init__(self, temperature, attn_dropout=0.):
+    def __init__(self, temperature, # In standard scaled dot-product attention, temperature = sqrt(d_k) to prevent large dot-product values
+                 # Without it, softmax becomes extremely peaky, leading to small gradients
+                 # Var(Q K / sqrt(d_k)) = 1
+                 attn_dropout=0.): # a [n_head, mask_num, concept_num] matrix with all 1 everywhere except mask[k][i][masked_qt[i]] = 0
         super().__init__()
         self.temperature = temperature
         self.dropout = attn_dropout
@@ -112,25 +121,40 @@ class ScaledDotProductAttention(nn.Module):
             mask: mask matrix
         Shape:
             q: [n_head, mask_num, embedding_dim]
-            k: [n_head, concept_num, embedding_dim]
+            k: [n_head, concept_num, embedding_dim] -> k.T: [n_head, embedding_dim, concept_num]
+            so atten(q, k): [n_head, mask_number, concept_num]
         Return: attention score of all queries
         """
         attn = torch.matmul(q / self.temperature, k.transpose(1, 2))  # [n_head, mask_number, concept_num]
+
+        # To ensure no self loop
         if mask is not None:
             attn = attn.masked_fill(mask == 0, -1e9)
         # pay attention to add training=self.training!
+
+        # Most attention implementations apply:
+        # softmax(attn, dim = -1), i.e., Each query’s attention over all concepts sums to 1
+        # The softmax is over the heads (edge types)
+        # Drop out is applied only during training
         attn = F.dropout(F.softmax(attn, dim=0), self.dropout, training=self.training)  # pay attention that dim=-1 is not as good as dim=0!
         return attn
 
 
+
+# READ
+# The encoder takes concept embeddings x0,x1,…,xC−1 and produces logits for every possible directed concept pair (i→j)
 class MLPEncoder(nn.Module):
+    # Take two concept embeddings (sender → receiver)
+    # and produce a vector of logits telling
+    # what edge type the edge belongs to.
     """
     MLP encoder module.
     NOTE: Stole and modify the code from https://github.com/ethanfetaya/NRI/blob/master/modules.py
     """
+    # hidden_dim: args.vae_encoder_dim
     def __init__(self, input_dim, hidden_dim, output_dim, factor=True, dropout=0., bias=True):
         super(MLPEncoder, self).__init__()
-        self.factor = factor
+        self.factor = factor # whether to use full factor graph encoder or a simpler encoder
         self.mlp = MLP(input_dim * 2, hidden_dim, hidden_dim, dropout=dropout, bias=bias)
         self.mlp2 = MLP(hidden_dim, hidden_dim, hidden_dim, dropout=dropout, bias=bias)
         if self.factor:
@@ -140,7 +164,13 @@ class MLPEncoder(nn.Module):
         self.fc_out = nn.Linear(hidden_dim, output_dim)
         self.init_weights()
 
+
+
+    # Default PyTorch (nn.Linear)   Uniform     Depends on fan_in
+    # Xavier Normal                 Normal      Depends on fan_in + fan_out
+    # He/Kaiming Normal             Normal      fan_in
     def init_weights(self):
+        # This walks through every submodule recursively, so:
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_normal_(m.weight.data)
@@ -148,8 +178,15 @@ class MLPEncoder(nn.Module):
 
     def node2edge(self, x, sp_send, sp_rec):
         # NOTE: Assumes that we have the same graph across all samples.
-        receivers = torch.matmul(sp_rec, x)
-        senders = torch.matmul(sp_send, x)
+
+
+        # sp_rec: [edge_num, concept_num]
+        # x:      [concept_num, embedding_dim]
+        # -----------------------------------
+        # receivers: [edge_num, embedding_dim]
+
+        receivers = torch.matmul(sp_rec, x) # for each edge, the embedding of its receiver node
+        senders = torch.matmul(sp_send, x) # for each edge, the embedding of its sender node
         edges = torch.cat([senders, receivers], dim=1)
         return edges
 
@@ -158,6 +195,7 @@ class MLPEncoder(nn.Module):
         incoming = torch.matmul(sp_rec_t, x)
         return incoming
 
+    # Neural Relational Inference
     def forward(self, inputs, sp_send, sp_rec, sp_send_t, sp_rec_t):
         r"""
         Parameters:
@@ -168,31 +206,92 @@ class MLPEncoder(nn.Module):
             sp_rec_t: one-hot encoded receive-node index(sparse tensor, transpose)
         Shape:
             inputs: [concept_num, embedding_dim]
-            sp_send: [edge_num, concept_num]
-            sp_rec: [edge_num, concept_num]
+            sp_send: [edge_num, concept_num]       # 1 in the 1st row and 2nd column, it means the sender of edge 0 is node 1
+            sp_rec: [edge_num, concept_num]        # edg_num = 2 * concept_num * (concept_num - 1)
             sp_send_t: [concept_num, edge_num]
             sp_rec_t: [concept_num, edge_num]
         Return:
             output: [edge_num, edge_type_num]
         """
+        # inputs in [concept_num, embedding_dim]
         x = self.node2edge(inputs, sp_send, sp_rec)  # [edge_num, 2 * embedding_dim]
-        x = self.mlp(x)  # [edge_num, hidden_num]
-        x_skip = x
+        x = self.mlp(x)  # edge features, shape [E, H]
+        x_skip = x # to create skip connection later
 
         if self.factor:
+
+            # Concatenation allows the final representation to:
+            # retain raw edge information (from embeddings)
+            # include message-passed relational information (via nodes)
+            # learn to weight/combine them through the following MLP
+
+            # This introduces global relational reasoning:
+            # Edges influence node states
+            # Node states influence other edges
+            # This allows detection of higher-order relational structures.
+
+            # For each node j,
+            # Aggregate all incoming edges i → j
+            # Result is node feature: [C, H]
             x = self.edge2node(x, sp_send_t, sp_rec_t)  # [concept_num, hidden_num]
-            x = self.mlp2(x)  # [concept_num, hidden_num]
+
+            x = self.mlp2(x)  # [concept_num, hidden_num] # mix information between edges via nodes
             x = self.node2edge(x, sp_send, sp_rec)  # [edge_num, 2 * hidden_num]
             x = torch.cat((x, x_skip), dim=1)  # Skip connection  shape: [edge_num, 3 * hidden_num]
             x = self.mlp3(x)  # [edge_num, hidden_num]
-        else:
+
+        else: # Simple edge classifier
+            # x has shape [E, H] (new edge features)
+            # x_skip has shape [E, H] (original edge features from earlier)
+            
+            # ZERO message passing between edge. Data flows within a single edge only.
+
             x = self.mlp2(x)  # [edge_num, hidden_num]
             x = torch.cat((x, x_skip), dim=1)  # Skip connection  shape: [edge_num, 2 * hidden_num]
             x = self.mlp3(x)  # [edge_num, hidden_num]
-        output = self.fc_out(x)  # [edge_num, output_dim]
+
+        output = self.fc_out(x)  # [edge_num, output_dim] = [edge_num, edge_type_num]
         return output
 
 
+# Concept embeddings (C x D)
+#         │
+# node2edge
+#         ▼
+# Edge features (E x 2D)
+#         │
+#       MLP1
+#         ▼
+# Edge features h_e (E x H)
+#         │
+#    (skip saved)
+#         │
+# edge2node (aggregate incoming messages)
+#         ▼
+# Node features (C x H)
+#         │
+#       MLP2
+#         ▼
+# Node features (C x H)
+#         │
+# node2edge
+#         ▼
+# Edge features (E x 2H)
+#         │ concat with skip (E x H)
+#         ▼
+# Concatenated edge feature (E x 3H)
+#         │
+#       MLP3
+#         ▼
+# Edge features (E x H)
+#         │
+#    Linear → output logits
+#         ▼
+# Final logits (E x K)
+
+
+
+# DONE
 class MLPDecoder(nn.Module):
     """
     MLP decoder module.
@@ -205,8 +304,14 @@ class MLPDecoder(nn.Module):
         self.edge_type_num = edge_type_num
         self.dropout = dropout
 
+        # For each edge type k, create two MLPs layers
+        # Layer 1 maps [xi || xj] in R^{2D} to R^{msg_hidden_dim}
+        # Layer 2 maps hidden → output message dim (msg_output_dim)
         self.msg_fc1 = nn.ModuleList([nn.Linear(2 * input_dim, msg_hidden_dim, bias=bias) for _ in range(edge_type_num)])
         self.msg_fc2 = nn.ModuleList([nn.Linear(msg_hidden_dim, msg_output_dim, bias=bias) for _ in range(edge_type_num)])
+
+        # These are edge-type-specific message functions.
+        # output x_hat in R^{D}
         self.out_fc1 = nn.Linear(msg_output_dim, hidden_dim, bias=bias)
         self.out_fc2 = nn.Linear(hidden_dim, hidden_dim, bias=bias)
         self.out_fc3 = nn.Linear(hidden_dim, input_dim, bias=bias)
@@ -231,6 +336,14 @@ class MLPDecoder(nn.Module):
             sp_rec: one-hot encoded receive-node index(sparse tensor)
             sp_send_t: one-hot encoded send-node index(sparse tensor, transpose)
             sp_rec_t: one-hot encoded receive-node index(sparse tensor, transpose)
+
+            inputs	    [C, D]	Concept embeddings (the original data we want to reconstruct)
+            rel_type	[E, K]	Edge type assignments for each edge (sampled by Gumbel-Softmax)
+            sp_send	    [E, C]	1-hot: sender node index for each edge
+            sp_rec	    [E, C]	1-hot: receiver node index for each edge
+            sp_send_t	[C, E]	transpose of sp_send
+            sp_rec_t	[C, E]	transpose of sp_rec
+
         Shape:
             inputs: [concept_num, embedding_dim]
             sp_send: [edge_num, concept_num]
@@ -242,14 +355,20 @@ class MLPDecoder(nn.Module):
         """
         # NOTE: Assumes that we have the same graph across all samples.
         # Node2edge
-        pre_msg = self.node2edge(inputs, sp_send, sp_rec)
+
+        # Build pre-messages for each directed edge
+        pre_msg = self.node2edge(inputs, sp_send, sp_rec)  # [edge_num, 2 * embedding_dim] = [E, 2D]
+
+        # Initialize all messages to zero
         all_msgs = Variable(torch.zeros(pre_msg.size(0), self.msg_out_dim, device=inputs.device))  # [edge_num, msg_out_dim]
+
+        # m_ij = sum from k=1 to K of (msg_ij^k * z_ij^k)
         for i in range(self.edge_type_num):
-            msg = F.relu(self.msg_fc1[i](pre_msg))
+            msg = F.relu(self.msg_fc1[i](pre_msg)) # [E, msg_hidden]
             msg = F.dropout(msg, self.dropout, training=self.training)
-            msg = F.relu(self.msg_fc2[i](msg))
-            msg = msg * rel_type[:, i:i + 1]
-            all_msgs += msg
+            msg = F.relu(self.msg_fc2[i](msg)) # [E, msg_out_dim]
+            msg = msg * rel_type[:, i:i + 1] # [E, msg_out_dim] * [E, 1] and broadcast to [E, msg_out_dim]
+            all_msgs += msg # [E, msg_out_dim]
 
         # Aggregate all msgs to receiver
         agg_msgs = self.edge2node(all_msgs, sp_send_t, sp_rec_t)  # [concept_num, msg_out_dim]
@@ -257,4 +376,24 @@ class MLPDecoder(nn.Module):
         pred = F.dropout(F.relu(self.out_fc1(agg_msgs)), self.dropout, training=self.training)  # [concept_num, hidden_dim]
         pred = F.dropout(F.relu(self.out_fc2(pred)), self.dropout, training=self.training)  # [concept_num, hidden_dim]
         pred = self.out_fc3(pred)  # [concept_num, embedding_dim]
-        return pred
+        return pred # [C, D]
+    
+
+
+# x in (C × D) ---- x is the concept embedding matrix
+#    │
+# node2edge
+#    ▼
+# pre_msg (E × 2D)
+#    │ per-type MLP
+#    ├──> msg_k  (E × M)  ── weight by z_k ──┐
+#    ├──> msg_k  (E × M)  ── weight by z_k ──┤ sum → all_msgs
+#    └──> msg_k  ...                        ┘
+#    ▼
+# all_msgs (E × M)
+#    │ edge2node
+#    ▼
+# agg_msgs (C × M)
+#    │ MLP
+#    ▼
+# pred (C × D)
